@@ -1,185 +1,152 @@
-const byte PIN_SENSOR = A1;      // Entrada analógica 0‑1023
-const byte PIN_MOTOR  =  9;      // Salida PWM 0‑255 (opcional)
+// --- Pinout y constantes ---
+const byte PIN_SENSOR        = A1;   // No hace falta pinMode()
+const int  TIEMPO_MUESTREO_MS = 100; // ms
+const int  N_MUESTRAS         = 100; // muestras por corrida
+const int  MAX_CORRIDAS       = 50;  // número máximo de corridas
 
-const int  TIEMPO_MUESTREO_MS = 100;   // 100 ms entre lecturas
-const int  N_MUESTRAS         = 100;   // 100 lecturas por ciclo
-const int  MAX_CORRIDAS       = 50;    // Hasta 50 promedios guardados
+// --- Memoria para resultados (en SRAM global) ---
+float referencia[MAX_CORRIDAS];     // slm
+float promedioVolt[MAX_CORRIDAS];   // V
+float promedioFlujo[MAX_CORRIDAS];  // slm
+float precision_[MAX_CORRIDAS];     // V (desviación)
+float exactitud_[MAX_CORRIDAS];     // slm (error abs)
+int   nCorridas = 0;
 
-/* ---------- Memoria para guardar resultados ---------- */
-float referencia [MAX_CORRIDAS];
-float promedio   [MAX_CORRIDAS];
-float promedio_flujo   [MAX_CORRIDAS];
-float precision   [MAX_CORRIDAS];
-float exactitud   [MAX_CORRIDAS];
-int   nCorridas  = 0;
+// --- Variables de estado ---
+float refActual = 0.0;
+bool  midiendo  = false;
 
-/* ---------------calculos de solo un dato-----------*/
-
-
-/* ---------- Variables de trabajo ---------- */
-String bufferEntrada = "";   // Guarda lo que tecleas
-float  refActual     = 0.0;  // Valor del anemómetro en la corrida
-bool   midiendo      = false;
+// --- Prototipos ---
+void mensajeBienvenida();
+void loop();
+void medirPromedio();
+float calcularPrecision(const float datos[], float media);
+float calcularExactitud(float promedioFlujo, float flujoReal);
+void imprimirCSV();
 
 void setup() {
-  pinMode(PIN_SENSOR, INPUT); 
   Serial.begin(9600);
-  while (!Serial);                 // Espera USB en placas Leonardo/MKRs
-
+  while (!Serial) ;  // para Leonardo/MKR
   mensajeBienvenida();
 }
 
 void loop() {
   if (Serial.available()) {
-    String entrada = Serial.readStringUntil('\n'); // Lee hasta salto de línea
-    entrada.trim();  // Quita espacios en blanco
+    // Leer línea entera
+    char buf[16];
+    byte len = Serial.readBytesUntil('\n', buf, sizeof(buf) - 1);
+    buf[len] = '\0';
+    // Quitar \r si existe
+    if (len && buf[len-1] == '\r') buf[len-1] = '\0';
 
-    if (entrada.equalsIgnoreCase("q")) {
+    // Comando 'q'
+    if (strcasecmp(buf, "q") == 0) {
       imprimirCSV();
-      while (true);
+      while (1) ;  // fin
     }
 
-    if (!midiendo && entrada.length() > 0) {
-      refActual = entrada.toFloat();
-      Serial.print("\n--> Referencia recibida: ");
+    // Nuevo valor de referencia
+    if (!midiendo && len > 0) {
+      refActual = atof(buf);
+      Serial.print(F("\n--> Referencia recibida: "));
       Serial.print(refActual, 2);
-      Serial.println("  (iniciando medición…)\n");
+      Serial.println(F(" slm  (iniciando medición…)\n"));
       midiendo = true;
       medirPromedio();
-      calcularPrecision();
-      calcularExactitud();
     }
   }
 }
 
-/* ============= 2. Medir 100 datos, promediar y guardar ============= */
 void medirPromedio() {
+  static float voltajes[N_MUESTRAS];  // mueve a estático para ahorrar pila
+  float sumaVolt = 0.0;
+  float sumaFlujo = 0.0;
 
-  float suma = 0.0;
-  float suma_flu = 0.0;
+  Serial.println(F(">> Medición en curso, espera..."));
 
+  // 1) Leer N muestras
   for (int i = 0; i < N_MUESTRAS; i++) {
+    int   adc  = analogRead(PIN_SENSOR);
+    float volt = adc * 5.0f / 1023.0f;
+    float flujo = 212.5f * (volt / 5.0f - 0.1f) - 10.0f;
 
-    int   adc   = analogRead(PIN_SENSOR);      // 0‑1023
-    float volt  = adc * 5.0 / 1023.0;          // 0‑5 V
+    voltajes[i] = volt;
+    sumaVolt   += volt;
+    sumaFlujo  += flujo;
 
-    // Conversión SFM3020 → caudal en slm
-    float flujo = 212.5 * (volt / 5.0 - 0.1) - 10.0;
-
-    suma += volt;
-    suma_flu += flujo;
     delay(TIEMPO_MUESTREO_MS);
-    Serial.println(volt);
   }
 
-  float promedioVoltaje = suma / N_MUESTRAS;
-  float promedioFlujo = suma_flu / N_MUESTRAS;
+  // 2) Promedios
+  float promV   = sumaVolt  / N_MUESTRAS;
+  float promF   = sumaFlujo / N_MUESTRAS;
 
-  // Guardar si hay espacio
+  // 3) Precisión y exactitud
+  float desv    = calcularPrecision(voltajes, promV);
+  float errAbs  = calcularExactitud(promF, refActual);
+
+  // 4) Guardar resultados
   if (nCorridas < MAX_CORRIDAS) {
-    referencia [nCorridas] = refActual;
-    promedio  [nCorridas] = promedioVoltaje;
-    promedio_flujo  [nCorridas] = promedioFlujo;
+    referencia[nCorridas]     = refActual;
+    promedioVolt[nCorridas]   = promV;
+    promedioFlujo[nCorridas]  = promF;
+    precision_[nCorridas]     = desv;
+    exactitud_[nCorridas]     = errAbs;
     nCorridas++;
   } else {
-    Serial.println(">> Memoria llena: no se guardó el dato.");
+    Serial.println(F(">> Memoria llena: corrida descartada"));
   }
 
-  Serial.print("Promedio medido = ");
-  Serial.print(promedioFlujo, 2);
-  Serial.println("V");
-  Serial.println("\n¿Deseas otra medición?  "
-                 "Escribe el nuevo valor del anemómetro "
-                 "o 'q' para terminar.\n");
+  // 5) Mostrar por consola
+  Serial.print(F("Promedio flujo = "));
+  Serial.print(promF, 2);
+  Serial.println(F(" slm"));
 
-  midiendo = false;                // Vuelve al estado de espera
+  Serial.print(F("Precisión (σ) = "));
+  Serial.print(desv, 4);
+  Serial.println(F(" V"));
+
+  Serial.print(F("Exactitud (abs) = "));
+  Serial.print(errAbs, 2);
+  Serial.println(F(" slm\n"));
+
+  Serial.println(F("Escribe nueva referencia o 'q' para terminar.\n"));
+  midiendo = false;
 }
 
-/* -------------------caclulo el presicion----------------------------- */
-
-void calcularPrecision() {
-  float voltajes[N_MUESTRAS];
-  float suma = 0.0;
-
-  // 1. Tomar muestras y calcular suma
+float calcularPrecision(const float datos[], float media) {
+  float suma2 = 0.0;
   for (int i = 0; i < N_MUESTRAS; i++) {
-    int adc = analogRead(PIN_SENSOR);
-    float volt = adc * 5.0 / 1023.0;
-    voltajes[i] = volt;
-    suma += volt;
-    delay(TIEMPO_MUESTREO_MS);
+    float d = datos[i] - media;
+    suma2 += d * d;
   }
-
-  // 2. Calcular media
-  float media = suma / N_MUESTRAS;
-
-  // 3. Calcular suma de los cuadrados de las diferencias
-  float sumaCuadrados = 0.0;
-  for (int i = 0; i < N_MUESTRAS; i++) {
-    sumaCuadrados += pow(voltajes[i] - media, 2);
-  }
-
-  // 4. Calcular desviación estándar
-  float desviacion = sqrt(sumaCuadrados / (N_MUESTRAS - 1));  // o /N_MUESTRAS si es población
-
-  // 5. Guardar si hay espacio
-  if ((nCorridas - 1) < MAX_CORRIDAS) {
-    precision[nCorridas - 1] = desviacion;  // ← Se guarda en la corrida actual
-    Serial.print("Precisión (desviación estándar): ");
-    Serial.println(desviacion, 4);
-  } else {
-    Serial.println(">> Memoria llena: no se guardó la precisión.");
-  }
+  return sqrt(suma2 / (N_MUESTRAS - 1));
 }
 
-/*--------------Calcular exactitud----------------------*/
-void calcularExactitud() {
-  int index = nCorridas-1;  // Último dato
-
-  if (index >= 0 && index < MAX_CORRIDAS) {
-    float valorReal    = referencia[index];  // Anemómetro
-    float valorMedido  = promedio_flujo[index];    // Sensor a calibrar
-
-    if (valorReal != 0.0) {
-      float errorRelativo = abs(valorMedido - valorReal) / valorReal;
-      exactitud[index] = 100.0 - (errorRelativo * 100.0);
-
-      Serial.print("Exactitud del sensor respecto al anemómetro: ");
-      Serial.print(exactitud[index], 2);
-      Serial.println(" %");
-    } else {
-      exactitud[index] = 0.0;
-      Serial.println("Referencia = 0. No se puede calcular la exactitud.");
-    }
-  }
+float calcularExactitud(float promedioFlujo, float flujoReal) {
+  return fabs(flujoReal - promedioFlujo);
 }
 
-
-/* ============= 3. Mostrar resultados en CSV al final ============= */
 void imprimirCSV() {
-  Serial.println("\n====== RESULTADOS ======");
-  Serial.println("Anemometro (slm) , Promedio(V) , Precision(V) , Exactitud(slm)");
-
+  Serial.println(F("\n====== RESULTADOS CSV ======"));
+  Serial.println(F("Ref(slm)   FlujoAvg(slm)  VoltAvg(V)  Prec(%)  Exact(%)"));
   for (int i = 0; i < nCorridas; i++) {
-
-
-    Serial.print(referencia[i], 2);
-    Serial.print(",              ");
-    Serial.print(promedio[i], 2);
-    Serial.print(",           ");
-    Serial.print((precision[i]/promedio[i])*100, 2);
-    Serial.print("%");
-    Serial.print(exactitud[i]/promedio_flujo[i], 2);
-    Serial.println("%");
+    // Prec % = (σ / VoltAvg) ·100
+    float p = precision_[i] / promedioVolt[i] * 100.0f;
+    // Err % = (Exactitud / FlujoAvg) ·100
+    float e = exactitud_[i] / promedioFlujo[i] * 100.0f;
+    Serial.print(referencia[i], 2);    Serial.print("       ");
+    Serial.print(promedioFlujo[i], 2); Serial.print("         ");
+    Serial.print(promedioVolt[i], 2);  Serial.print("       ");
+    Serial.print(p, 2);                Serial.print("      ");
+    Serial.println(e, 2);
   }
-
-  Serial.println("========================");
-  Serial.println("Copia este bloque y pégalo en Excel :)");
+  Serial.println(F("============================"));
+  Serial.println(F("Copia y pega en Excel :)"));
 }
 
-/* ---------- Mensaje inicial ---------- */
 void mensajeBienvenida() {
-  Serial.println("=== Calibración de flujo ===");
-  Serial.println("Escribe el valor del anemómetro y pulsa Enter.");
-  Serial.println("Para finalizar, escribe:  q  y pulsa Enter.\n");
+  Serial.println(F("=== Calibración de flujo ==="));
+  Serial.println(F("Escribe valor del anemómetro (slm) y Enter."));
+  Serial.println(F("Para terminar, escribe 'q' + Enter.\n"));
 }
