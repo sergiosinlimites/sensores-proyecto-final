@@ -4,73 +4,64 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import serial
 import numpy as np
+import pandas as pd
 import time
+import re
+from reportlab.lib.pagesizes import letter
+from reportlab.pdfgen import canvas
+from reportlab.lib.units import cm
 
 class FlowCalibrationApp:
     def __init__(self, master):
         self.master = master
         master.title("Calibración de Flujómetro")
-        master.geometry("960x700")
+        master.geometry("960x800")
 
-        # ── Marco de controles a la izquierda ────────────────────────────────
+        # Controles izquierda
         control = ttk.Frame(master, padding=20)
         control.pack(side=tk.LEFT, fill=tk.Y)
 
-        # Puerto y botón Conectar
         ttk.Label(control, text="Puerto serie (ej. COM3 / /dev/ttyUSB0):").pack(anchor=tk.W)
-        self.port_entry = ttk.Entry(control)
-        self.port_entry.insert(0, "COM3")
+        self.port_entry = ttk.Entry(control); self.port_entry.insert(0, "COM3")
         self.port_entry.pack(fill=tk.X, pady=(0,10))
-        self.connect_btn = ttk.Button(control, text="Conectar", command=self.connect_serial)
-        self.connect_btn.pack(fill=tk.X, pady=(0,10))
+        ttk.Button(control, text="Conectar", command=self.connect_serial).pack(fill=tk.X, pady=(0,10))
 
-        # Flujo real (anemómetro)
         ttk.Label(control, text="Flujo real (L/min):").pack(anchor=tk.W)
-        self.flow_entry = ttk.Entry(control)
-        self.flow_entry.pack(fill=tk.X, pady=(0,10))
+        self.flow_entry = ttk.Entry(control); self.flow_entry.pack(fill=tk.X, pady=(0,10))
 
-        # Voltaje/precisión leído
-        ttk.Label(control, text="Precisión (σ) V:").pack(anchor=tk.W)
+        ttk.Label(control, text="Precisión (σ):").pack(anchor=tk.W)
         self.precision_var = tk.StringVar(value="n/a")
-        self.precision_entry = ttk.Entry(control, textvariable=self.precision_var, state="readonly")
-        self.precision_entry.pack(fill=tk.X, pady=(0,10))
+        ttk.Entry(control, textvariable=self.precision_var, state="readonly").pack(fill=tk.X, pady=(0,10))
 
-        # Botón para tomar medida (envía referencia y parsea precisión)
-        self.take_btn = ttk.Button(control, text="Tomar medida", command=self.take_measurement)
-        self.take_btn.pack(fill=tk.X, pady=(0,10))
+        ttk.Button(control, text="Tomar medida", command=self.take_measurement).pack(fill=tk.X, pady=(0,10))
+        ttk.Button(control, text="Exportar datos (.txt)", command=self.export_data).pack(fill=tk.X, pady=(0,5))
+        ttk.Button(control, text="Generar reporte (.pdf)", command=self.generate_report).pack(fill=tk.X)
 
-        # Botón para exportar datos
-        self.export_btn = ttk.Button(control, text="Exportar datos (.txt)", command=self.export_data)
-        self.export_btn.pack(fill=tk.X)
+        ttk.Label(control, text="Datos resumen:").pack(anchor=tk.W, pady=(10,0))
+        self.info_var = tk.StringVar(value="")
+        ttk.Label(control, textvariable=self.info_var, wraplength=200, justify=tk.LEFT).pack(fill=tk.X)
 
-        # Datos y selección
-        self.experiments = []        # [(flujo, precisión), ...]
-        self.selected_flows = []     # flujos seleccionados para desviaciones
+        # Datos
+        self.experiments = []   # cada dict: ref, flowAvg, voltAvg, prec, exact, meas
+        self.selected = []      # índices seleccionados
 
-        # ── Panel de gráficas y consola a la derecha ─────────────────────────
-        right_frame = ttk.Frame(master)
-        right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+        # Panel derecho: gráficos + consola
+        right = ttk.Frame(master); right.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
 
-        # Gráficas
-        self.fig, (self.ax_scatter, self.ax_dev) = plt.subplots(2, 1, figsize=(6, 6))
+        self.fig, (self.ax_scatter, self.ax_dev) = plt.subplots(2, 1, figsize=(6,6))
         self.fig.tight_layout(pad=3)
-        self.canvas = FigureCanvasTkAgg(self.fig, master=right_frame)
+        self.canvas = FigureCanvasTkAgg(self.fig, master=right)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
         self.canvas.mpl_connect('pick_event', self.on_pick)
 
-        # Consola estilo Arduino (solo lectura)
-        console_frame = ttk.Frame(right_frame)
-        console_frame.pack(fill=tk.BOTH, expand=False, pady=(10,0))
+        console_frame = ttk.Frame(right); console_frame.pack(fill=tk.BOTH, pady=(10,0))
         self.console_text = tk.Text(console_frame, height=8, state='disabled')
-        scrollbar = ttk.Scrollbar(console_frame, orient='vertical', command=self.console_text.yview)
-        self.console_text['yscrollcommand'] = scrollbar.set
+        sb = ttk.Scrollbar(console_frame, orient='vertical', command=self.console_text.yview)
+        self.console_text['yscrollcommand'] = sb.set
         self.console_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
 
-        # Serial
         self.ser = None
-
-        # Iniciar loop de lectura de serial
         self.master.after(100, self.read_serial)
 
     def connect_serial(self):
@@ -82,184 +73,263 @@ class FlowCalibrationApp:
             self.ser = serial.Serial(port, baudrate=9600, timeout=0.1)
             messagebox.showinfo("Puerto conectado", f"Conectado a {port}")
         except Exception as e:
-            messagebox.showwarning("No conectado",
-                                   f"No se pudo abrir {port}:\n{e}\nModo test activo.")
+            messagebox.showwarning("No conectado", f"No se pudo abrir {port}:\n{e}\nModo test activo.")
             self.ser = None
 
     def take_measurement(self):
-        # validar flujo ingresado
         try:
-            flow = float(self.flow_entry.get())
+            ref = float(self.flow_entry.get())
         except ValueError:
             messagebox.showerror("Entrada inválida", "El flujo debe ser un número.")
             return
-
         if not (self.ser and self.ser.is_open):
-            messagebox.showwarning("Sin conexión", "No hay puerto serie abierto.")
+            messagebox.showwarning("Sin conexión", "Conecta primero el puerto serie.")
             return
 
-        # enviar referencia de flujo al Arduino
-        try:
-            self.ser.write(f"{flow}\n".encode())
-        except Exception as e:
-            messagebox.showerror("Error envío", f"No se pudo enviar referencia:\n{e}")
-            return
+        self.ser.reset_input_buffer()
+        self.ser.write(f"{ref}\n".encode())
 
-        # bloquear hasta recibir la línea "Precisión (σ) = X V"
-        precision = None
-        t0 = time.time()
-        timeout = 30.0  # segundos máximos de espera
+        meas, flowAvg, voltAvg, prec, exact = [], None, None, None, None
+        t0, timeout = time.time(), 30.0
+
         while True:
             if time.time() - t0 > timeout:
-                messagebox.showerror("Timeout",
-                                     f"No se recibió 'Precisión' en {timeout:.0f}s.")
+                messagebox.showerror("Timeout", f"No se recibió resumen en {timeout:.0f}s.")
                 return
-
             raw = self.ser.readline().decode(errors='ignore')
             if not raw:
-                continue
+                self.master.update(); continue
             line = raw.strip()
             self._console_insert(line + "\n")
 
-            if line.lower().startswith("precisión"):
-                # form. esperada: "Precisión (σ) = 0.0229 V"
-                try:
-                    val_str = line.split('=')[1].split('V')[0].strip()
-                    precision = float(val_str)
-                except Exception:
-                    precision = None
+            if re.match(r'^\d+(\.\d+)?$', line):
+                meas.append(float(line)); self.master.update()
+
+            low = line.lower()
+            if low.startswith("promedio flujo"):
+                try: flowAvg = float(line.split('=')[1].split()[0])
+                except: pass
+            elif low.startswith("voltavg"):
+                try: voltAvg = float(line.split('=')[1].split()[0])
+                except: pass
+            elif low.startswith("precisión") or low.startswith("prec"):
+                try: prec = float(line.split('=')[1].split()[0])
+                except: pass
+            elif low.startswith("exactitud"):
+                try: exact = float(line.split('=')[1].split()[0])
+                except: pass
                 break
 
-        if precision is None:
-            messagebox.showerror("No data", "No se recibió el dato de precisión.")
+        if None in (flowAvg, prec, exact):
+            messagebox.showerror("Parse error", "Faltan datos en el resumen.")
             return
 
-        # actualizar casilla y añadir experimento
-        self.precision_var.set(f"{precision:.4f}")
-        self.experiments.append((flow, precision))
+        self.precision_var.set(f"{prec:.4f}")
+        self.experiments.append({
+            'ref': ref,
+            'flowAvg': flowAvg,
+            'voltAvg': voltAvg if voltAvg is not None else flowAvg,
+            'prec': prec,
+            'exact': exact,
+            'meas': meas
+        })
+        self.selected = [len(self.experiments)-1]
+        self._update_summary(len(self.experiments)-1)
         self.update_plots()
 
+    def _update_summary(self, idx):
+        e = self.experiments[idx]
+        summary = (
+            f"1. Ref: {e['ref']:.2f} slm\n"
+            f"2. VoltAvg: {e['voltAvg']:.3f} V\n"
+            f"3. Precisión: {e['prec']:.3f}\n"
+            f"4. Exactitud: {e['exact']:.3f}\n"
+            f"5. N datos: {len(e['meas'])}"
+        )
+        self.info_var.set(summary)
+
     def read_serial(self):
-        """Lee líneas de la serial y las muestra (solo logs)."""
         if self.ser and self.ser.is_open:
             try:
                 line = self.ser.readline().decode(errors='ignore')
-                if line:
-                    self._console_insert(line)
-            except:
-                pass
+                if line: self._console_insert(line)
+            except: pass
         self.master.after(100, self.read_serial)
 
-    def _console_insert(self, text):
+    def _console_insert(self, txt):
         self.console_text.configure(state='normal')
-        self.console_text.insert('end', text)
+        self.console_text.insert('end', txt)
         self.console_text.see('end')
         self.console_text.configure(state='disabled')
 
     def on_pick(self, event):
         idx = event.ind[0]
-        flow = self.flows[idx]
-        count = np.sum(np.isclose(self.flows, flow, atol=1e-3))
-        if count < 2:
-            messagebox.showwarning("Sin comparaciones",
-                                   f"El flujo {flow:.3f} L/min solo tiene {count} muestra(s).")
-            return
-        if flow in self.selected_flows:
-            self.selected_flows.remove(flow)
-        else:
-            self.selected_flows.append(flow)
+        self.selected = [idx]
+        self._update_summary(idx)
         self.update_plots()
 
     def update_plots(self):
-        # preparar arrays
-        self.flows = np.array([f for f, p in self.experiments])
-        self.precs = np.array([p for f, p in self.experiments])
-
-        # ── Scatter & regresión global ──────────────────────────────────────
+        # Gráfica superior: scatter vs referencia y linealización
         self.ax_scatter.clear()
-        colors = ['C1' if f in self.selected_flows else 'C0' for f in self.flows]
-        self.ax_scatter.scatter(self.flows, self.precs,
-                                c=colors, edgecolor='k',
-                                picker=5, zorder=3)
-        self.ax_scatter.set_xlabel("Flujo real (L/min)")
-        self.ax_scatter.set_ylabel("Precisión (σ) V")
-        if len(self.flows) > 1:
-            m, b = np.polyfit(self.flows, self.precs, 1)
-            r2 = np.corrcoef(self.flows, self.precs)[0,1]**2
-            xs = np.linspace(self.flows.min(), self.flows.max(), 100)
-            self.ax_scatter.plot(xs, m*xs + b, label=f"y={m:.3f}x+{b:.3f}", zorder=2)
-            self.ax_scatter.text(0.05, 0.95,
-                                 f"y = {m:.3f}x + {b:.3f}\nR² = {r2:.3f}",
-                                 transform=self.ax_scatter.transAxes,
-                                 va="top", bbox=dict(fc="w", alpha=0.7))
-        self.ax_scatter.legend()
-
-        # ── Campanas de desviación ─────────────────────────────────────────
-        self.ax_dev.clear()
-        if not self.selected_flows:
-            self.ax_dev.text(0.5, 0.5,
-                             "Haz click en uno o varios\npuntos arriba",
-                             ha="center", va="center",
-                             transform=self.ax_dev.transAxes)
+        if self.experiments:
+            refs  = np.array([e['ref']     for e in self.experiments])
+            volts = np.array([e['voltAvg'] for e in self.experiments])
+            colors= ['r' if i in self.selected else 'C0' for i in range(len(refs))]
+            sizes = [100 if i in self.selected else 60 for i in range(len(refs))]
+            self.ax_scatter.scatter(refs, volts,
+                                    c=colors, s=sizes,
+                                    edgecolor='k', picker=5, zorder=3,
+                                    label="Mediciones")
+            if len(refs) > 1:
+                m, b = np.polyfit(refs, volts, 1)
+                r2   = np.corrcoef(refs, volts)[0,1]**2
+                xs   = np.linspace(refs.min(), refs.max(), 100)
+                self.ax_scatter.plot(xs, m*xs + b,
+                                     label=f"y={m:.3f}x+{b:.3f}, R²={r2:.3f}",
+                                     zorder=2)
+            self.ax_scatter.legend()
         else:
-            cmap = plt.cm.get_cmap("tab10", len(self.selected_flows))
-            global_limit = 0
-            for i, flow in enumerate(self.selected_flows):
-                mask = np.isclose(self.flows, flow, atol=1e-3)
-                group = self.precs[mask]
-                μ = group.mean()
-                deviations = group - μ
-                σ = deviations.std(ddof=0)
-                limit_dev = max(4*σ, np.abs(deviations).max())
-                global_limit = max(global_limit, limit_dev)
-                x = np.linspace(-limit_dev, limit_dev, 300)
-                pdf_norm = np.exp(-0.5 * (x/σ)**2)
-                color = cmap(i)
-                self.ax_dev.plot(x, pdf_norm, color=color,
-                                 label=f"{flow:.3f} L/min", zorder=2)
-                idx_max = np.argmax(np.abs(deviations))
-                wd = deviations[idx_max]
-                wp = np.exp(-0.5*(wd/σ)**2)
-                self.ax_dev.scatter(wd, wp, color=color,
-                                    edgecolor='k', s=60, zorder=3)
-                self.ax_dev.text(wd, wp+0.05,
-                                 f"{wd:.3f} V", ha="center", va="bottom",
-                                 color=color)
-            self.ax_dev.set_xlabel("Desviación del voltaje (V)")
-            self.ax_dev.set_ylabel("Densidad relativa")
-            self.ax_dev.set_xlim(-global_limit, global_limit)
-            self.ax_dev.set_ylim(0, 1.1)
-            self.ax_dev.legend(loc="upper right")
+            self.ax_scatter.set_title("Sin datos")
+        self.ax_scatter.set_xlabel("Flujo de referencia (slm)")
+        self.ax_scatter.set_ylabel("VoltAvg (V)")
 
+        # Gráfica inferior: desviaciones del experimento seleccionado
+        self.ax_dev.clear()
+        if self.experiments and self.selected:
+            idx  = self.selected[0]
+            data = np.array(self.experiments[idx]['meas'])
+            mu, dev, std = data.mean(), data - data.mean(), data.std()
+            lim = max(4*std, abs(dev).max())
+            x   = np.linspace(-lim, lim, 300)
+            pdf = np.exp(-0.5*(x/std)**2)
+            self.ax_dev.plot(x, pdf, color='C0', label=f"Exp {idx+1}", zorder=2)
+
+            y_pts = np.exp(-0.5*(dev/std)**2)
+            self.ax_dev.scatter(dev, y_pts, color='C0', s=30, alpha=0.6, zorder=3)
+
+            ki = np.argmax(abs(dev))
+            wd, wp = dev[ki], np.exp(-0.5*(dev[ki]/std)**2)
+            self.ax_dev.scatter(wd, wp, color='r', edgecolor='k', s=80, zorder=4)
+            self.ax_dev.text(wd, wp+0.05, f"{data[ki]:.2f}",
+                             ha="center", va="bottom", color='r')
+
+            self.ax_dev.legend(loc="upper left")
+            self.ax_dev.set_title(f"Prom={mu:.2f} slm   σ={std:.2f} slm")
+            self.ax_dev.set_xlabel("Desviación (slm)")
+            self.ax_dev.set_ylabel("Densidad relativa")
         self.canvas.draw()
 
     def export_data(self):
+        """Exporta todos los experimentos a un .txt completo."""
         if not self.experiments:
             messagebox.showwarning("Sin datos", "No hay experimentos para exportar.")
             return
+
         path = filedialog.asksaveasfilename(defaultextension=".txt",
-                                            filetypes=[("Texto plano","*.txt")])
+                                            filetypes=[("Texto plano", "*.txt")])
         if not path:
             return
-        flows = np.array([f for f, p in self.experiments])
-        precs = np.array([p for f, p in self.experiments])
-        if len(flows) > 1:
-            m, b = np.polyfit(flows, precs, 1)
-            r2 = np.corrcoef(flows, precs)[0,1]**2
-            std = precs.std()
-            max_dev = np.abs(precs - precs.mean()).max()
-        else:
-            m = b = r2 = std = max_dev = 0.0
+
         with open(path, "w") as f:
-            f.write("Exp\tFlujo(L/min)\tPrecisión(σ) V\n")
-            for i, (fv, vv) in enumerate(self.experiments, 1):
-                f.write(f"{i}\t{fv:.3f}\t{vv:.4f}\n")
-            f.write("\n--- Estadísticas ---\n")
-            f.write(f"y = {m:.6f} x + {b:.6f}\n")
-            f.write(f"R² = {r2:.6f}\n")
-            f.write(f"Std (σ) = {std:.6f} V\n")
-            f.write(f"Max dev = {max_dev:.6f} V\n")
+            for i, e in enumerate(self.experiments, start=1):
+                f.write(f"=== Experimento {i} ===\n")
+                f.write(f"Flujo referencia: {e['ref']:.2f} slm\n")
+                f.write(f"VoltAvg:          {e['voltAvg']:.3f} V\n")
+                f.write(f"Precisión (σ):    {e['prec']:.3f}\n")
+                f.write(f"Exactitud (abs):  {e['exact']:.3f}\n")
+                f.write(f"Nº de datos:      {len(e['meas'])}\n")
+                f.write("Mediciones:\n")
+                # particionar en líneas de 10 valores
+                for j in range(0, len(e['meas']), 10):
+                    chunk = e['meas'][j:j+10]
+                    line = ", ".join(f"{v:.3f}" for v in chunk)
+                    f.write("  " + line + "\n")
+                f.write("\n")
+
+            # al final, la linealización global
+            refs  = np.array([ex['ref']     for ex in self.experiments])
+            volts = np.array([ex['voltAvg'] for ex in self.experiments])
+            if len(refs) > 1:
+                m, b = np.polyfit(refs, volts, 1)
+                r2   = np.corrcoef(refs, volts)[0,1]**2
+                f.write("=== Linealización global ===\n")
+                f.write(f"y = {m:.6f} x + {b:.6f}\n")
+                f.write(f"R² = {r2:.6f}\n")
         messagebox.showinfo("Exportado", f"Datos guardados en:\n{path}")
+
+    def generate_report(self):
+        if not self.experiments:
+            messagebox.showwarning("Sin datos", "No hay datos para generar reporte.")
+            return
+        # Diálogo para guardar PDF
+        path = filedialog.asksaveasfilename(defaultextension=".pdf",
+                                            filetypes=[("PDF","*.pdf")])
+        if not path:
+            return
+
+        # Crear canvas
+        c = canvas.Canvas(path, pagesize=letter)
+        width, height = letter
+
+        # Título con estilo
+        c.setFont("Helvetica-Bold", 18)
+        c.drawString(2*cm, height - 2*cm, "Reporte de Calibración de Flujómetro")
+        c.setLineWidth(1)
+        c.line(2*cm, height - 2.3*cm, width - 2*cm, height - 2.3*cm)
+
+        # Preparar texto
+        text = c.beginText(2*cm, height - 3*cm)
+        text.setFont("Helvetica", 10)
+        leading = 12
+        text.setLeading(leading)
+
+        # Escribir cada experimento
+        for i, e in enumerate(self.experiments, start=1):
+            # Encabezado de experimento en negrita
+            text.setFont("Helvetica-Bold", 12)
+            text.textLine(f"Experimento {i}:")
+            text.setFont("Helvetica", 10)
+
+            # Datos básicos
+            text.textLine(f"  • Flujo ref: {e['ref']:.2f} slm")
+            text.textLine(f"  • VoltAvg:   {e['voltAvg']:.3f} V")
+            text.textLine(f"  • Precisión: {e['prec']:.3f}")
+            text.textLine(f"  • Exactitud: {e['exact']:.3f}")
+            text.textLine(f"  • N datos:   {len(e['meas'])}")
+
+            # Mediciones, en líneas de máximo 10 valores
+            chunks = [e['meas'][j:j+10] for j in range(0, len(e['meas']), 10)]
+            for chunk in chunks:
+                line = ", ".join(f"{v:.3f}" for v in chunk)
+                text.textLine(f"    {line}")
+
+            # Espacio antes del siguiente experimento
+            text.textLine("")
+            # Si nos acercamos al final de la página, paginar
+            if text.getY() < 4*cm:
+                c.drawText(text)
+                c.showPage()
+                text = c.beginText(2*cm, height - 2*cm)
+                text.setFont("Helvetica", 10)
+                text.setLeading(leading)
+
+        # Al final, ecuación y R²
+        refs  = np.array([e['ref'] for e in self.experiments])
+        volts = np.array([e['voltAvg'] for e in self.experiments])
+        m, b  = np.polyfit(refs, volts, 1)
+        r2    = np.corrcoef(refs, volts)[0,1]**2
+
+        text.setFont("Helvetica-Bold", 12)
+        text.textLine("Linealización final:")
+        text.setFont("Helvetica", 10)
+        text.textLine(f"  y = {m:.6f} x + {b:.6f}")
+        text.textLine(f"  R² = {r2:.6f}")
+
+        # Dibujar y guardar
+        c.drawText(text)
+        c.save()
+
+        messagebox.showinfo("Reporte PDF", f"Reporte generado en:\n{path}")
 
 if __name__ == "__main__":
     root = tk.Tk()
