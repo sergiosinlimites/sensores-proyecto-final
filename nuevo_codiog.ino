@@ -11,6 +11,7 @@ float promedioFlujo[MAX_CORRIDAS];  // slm
 float precision_[MAX_CORRIDAS];     // V (desviación)
 float exactitud_[MAX_CORRIDAS];     // slm (error abs)
 int   nCorridas = 0;
+float offsetVoltaje = 0.0f;
 
 // --- Variables de estado ---
 float refActual = 0.0;
@@ -75,15 +76,29 @@ void medirPromedio() {
     sumaFlujo  += flujo;
 
     delay(TIEMPO_MUESTREO_MS);
+    Serial.println(volt);
   }
 
   // 2) Promedios
   float promV   = sumaVolt  / N_MUESTRAS;
   float promF   = sumaFlujo / N_MUESTRAS;
 
+// 3) Si enviaste referencia = 0 → calcular solo offset y salir
+if (refActual == 0.0f) {
+  offsetVoltaje = promV;
+  Serial.print(F("Offset calculado = "));
+  Serial.print(offsetVoltaje, 4);
+  Serial.println(F(" V\n"));
+  Serial.println(F("Envía ahora una referencia > 0 o 'q' para terminar.\n"));
+  midiendo = false;
+  return;  // salimos sin hacer conversión a flujo ni guardar nada
+}
+
   // 3) Precisión y exactitud
   float desv    = calcularPrecision(voltajes, promV);
   float errAbs  = calcularExactitud(promF, refActual);
+
+
 
   // 4) Guardar resultados
   if (nCorridas < MAX_CORRIDAS) {
