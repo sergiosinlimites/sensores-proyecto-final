@@ -89,7 +89,7 @@ if (refActual == 0.0f) {
   Serial.print(F("Offset calculado = "));
   Serial.print(offsetVoltaje, 4);
   Serial.println(F(" V\n"));
-  Serial.println(F("Envía ahora una referencia > 0 o 'q' para terminar.\n"));
+  Serial.println(F("Envía ahora una referencia > 0"));
   midiendo = false;
   return;  // salimos sin hacer conversión a flujo ni guardar nada
 }
@@ -125,7 +125,7 @@ if (refActual == 0.0f) {
   Serial.print(errAbs, 2);
   Serial.println(F(" slm\n"));
 
-  Serial.println(F("Escribe nueva referencia o 'q' para terminar.\n"));
+  Serial.println(F("Escribe nueva referencia"));
   midiendo = false;
 }
 
@@ -163,5 +163,5 @@ void imprimirCSV() {
 void mensajeBienvenida() {
   Serial.println(F("=== Calibración de flujo ==="));
   Serial.println(F("Escribe valor del anemómetro (slm) y Enter."));
-  Serial.println(F("Para terminar, escribe 'q' + Enter.\n"));
+  
 }
